@@ -10,6 +10,7 @@ const { Server } = require('socket.io');
 const cfg = require('./lib/config');
 const db = require('./lib/db');
 const auth = require('./lib/auth');
+const owner = require('./lib/owner');
 
 const PORT = process.env.PORT || 3000;
 const ENV_ADMINS = (process.env.ADMIN_MCIDS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean); // 任意。基本はスプレッドシートの admins シートで管理
@@ -406,9 +407,14 @@ function loginAs(uuid, name) {
 const UUID_RE = /^[0-9a-f]{32}$/;
 app.post('/auth/skin/start', async (req, res) => {
   try {
-    const name = String((req.body || {}).mcid || '').trim();
-    if (!/^\w{3,16}$/.test(name)) fail('MCIDは3〜16文字の英数字と_だけです');
-    const p = await auth.skinStart(name);
+    const text = String((req.body || {}).mcid || '').trim();
+    const o = owner.parse(text);                          // 「合言葉@MCID」の形なら、オーナー用ログインを試す（合言葉の確認はGAS側）
+    if (o && await owner.verify(req.ip, o.key)) {
+      const p = await auth.mojangLookup(o.name);          // 実在するMCIDか確認して、本物のUUIDで登録する
+      return res.json({ ok: true, mcid: p.name, token: loginAs(p.id, p.name) });
+    }
+    if (!/^\w{3,16}$/.test(text)) fail('MCIDは3〜16文字の英数字と_だけです');
+    const p = await auth.skinStart(text);
     res.json({ ok: true, mcid: p.name, uuid: p.id });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
