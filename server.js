@@ -1,6 +1,7 @@
 'use strict';
 /* Practice Tiers - サーバー（Express + Socket.IO）
- * データ: GAS(スプレッドシート) / MCID連携: スキン認証 or Microsoft / 画面: public/ */
+ * データ: GAS(スプレッドシート) / MCID連携: スキン認証 or Microsoft
+ * ログインはCookieではなく「トークン」方式。HTMLをどこ（Render / OneCompiler など）に置いても動く */
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -11,26 +12,53 @@ const db = require('./lib/db');
 const auth = require('./lib/auth');
 
 const PORT = process.env.PORT || 3000;
-const DEV_LOGIN = process.env.DEV_LOGIN === '1';
-const ADMINS = (process.env.ADMIN_MCIDS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const ENV_ADMINS = (process.env.ADMIN_MCIDS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean); // 任意。基本はスプレッドシートの admins シートで管理
 const RETEST_MS = Number(process.env.RETEST_DAYS ?? 14) * 864e5; // 同じ種目を再テストできるまでの日数
 const OFFLINE_MS = 3 * 60e3;                                       // 切断が続いたら受付/待機を自動解除
 
 const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, { cors: { origin: '*' } });
+
+// どのサイト（OneCompilerなど）のHTMLからでも呼べるようにする。Cookieは使わずトークン認証なので安全
+app.use((req, res, next) => {
+  res.set({
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  });
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public')));   // public/index.html があれば、それがトップページになる
+app.get('/', (_, res) => res.type('text/plain').send('Practice Tiers のサーバーは動いています。'));
 app.get('/healthz', (_, res) => res.send('ok'));
 
 const fail = msg => { throw new Error(msg); };
+
+// ログイン状態 = 「Authorization: Bearer トークン」（ブラウザが保存して、毎回送ってくる）
+const bearer = h => (String(h || '').match(/^Bearer (.+)$/) || [])[1];
+const userFromToken = t => { const p = auth.verify(t); return p ? db.users.get(p.uid) || null : null; };
 
 /* ================= ゲームロジック（Tier・ポイント・称号） ================= */
 const tierIdx = t => cfg.TIERS.indexOf(t);                       // 未ランクは -1
 const hasEvent = id => cfg.EVENTS.some(e => e.id === id);
 const evName = id => (cfg.EVENTS.find(e => e.id === id) || {}).name || id;
-const isAdmin = u => !!u && ADMINS.includes(u.mcid.toLowerCase());
+// 管理者(OP)：スプレッドシートの「admins」シートに書かれたMCID（＋任意で環境変数 ADMIN_MCIDS）。
+// その人が一度ログインするとUUIDが自動で記録され、以後は改名されても、同じ名前を取った別人が現れても、本人だけが管理者のまま。
+const isAdmin = u => !!u && (
+  ENV_ADMINS.includes(u.mcid.toLowerCase()) ||
+  db.getAdmins().some(a => (a.uuid ? a.uuid === u.id : a.mcid.toLowerCase() === u.mcid.toLowerCase()))
+);
+function pinAdmins() {
+  for (const a of db.getAdmins()) {
+    if (a.uuid) continue;
+    const u = db.findByMcid(a.mcid);
+    if (u) { a.uuid = u.id; db.pinAdmin(a); }
+  }
+}
 const tierOf = (uid, ev) => (db.getRating(uid, ev) || {}).tier || '';
 const titleOf = p => cfg.TITLES.find(t => p >= t.min).name;
 const pointsOf = uid => {
@@ -267,8 +295,8 @@ function adminSetTier(u, d) {
 
 /* ================= Socket.IO ================= */
 io.use((socket, next) => {
-  const p = auth.verify(auth.parseCookies(socket.handshake.headers.cookie).sid);
-  socket.uid = p && db.users.has(p.uid) ? p.uid : null;
+  const u = userFromToken(socket.handshake.auth && socket.handshake.auth.token);
+  socket.uid = u ? u.id : null;
   next();
 });
 
@@ -314,15 +342,12 @@ function goneOffline(uid) {
 }
 
 /* ================= REST API ================= */
-const authedUser = req => {
-  const p = auth.verify(auth.parseCookies(req.headers.cookie).sid);
-  return p ? db.users.get(p.uid) : null;
-};
+const authedUser = req => userFromToken(bearer(req.headers.authorization));
 
 app.get('/api/config', (_, res) => res.json({
   events: cfg.EVENTS, tiers: cfg.TIERS, tierPoints: cfg.TIER_POINTS, titles: cfg.TITLES,
   colors: cfg.COLORS, queueMax: cfg.QUEUE_MAX, testerMinTier: cfg.TESTER_MIN_TIER, spPerPoint: cfg.SP_PER_POINT,
-  msLogin: auth.msEnabled, devLogin: DEV_LOGIN,
+  msLogin: auth.msEnabled,
 }));
 
 app.get('/api/me', (req, res) => {
@@ -368,15 +393,16 @@ app.post('/api/shop/equip', (req, res) => shop(req, res, (u, d) => {
   u.color = d.color || '';
 }));
 
-/* ---- ログイン / MCID連携 ---- */
-function loginAs(req, res, uuid, name) {
+/* ---- ログイン / MCID連携（成功するとトークンを返す。ブラウザ側が保存して、以後ずっと送る） ---- */
+function loginAs(uuid, name) {
   let u = db.users.get(uuid);
   if (!u) { u = { id: uuid, mcid: name, color: '', owned: [], sp: 0, createdAt: Date.now() }; db.saveUser(u); }
   else if (u.mcid !== name) { u.mcid = name; db.saveUser(u); }          // 改名に追従（名前はMCIDに固定）
-  res.cookie('sid', auth.sign({ uid: uuid }), { httpOnly: true, sameSite: 'lax', secure: req.secure, maxAge: 365 * 864e5 });
+  pinAdmins();                                                          // 管理者リストにある人なら、ここでUUIDを記録
+  return auth.sign({ uid: uuid });
 }
 
-// A) スキン認証（承認不要）
+// A) スキン認証（Mojangの承認いらず）
 const UUID_RE = /^[0-9a-f]{32}$/;
 app.post('/auth/skin/start', async (req, res) => {
   try {
@@ -401,12 +427,11 @@ app.post('/auth/skin/check', async (req, res) => {
     const uuid = String((req.body || {}).uuid || '');
     if (!UUID_RE.test(uuid)) fail('不正なリクエストです');
     const p = await auth.skinCheck(uuid);
-    loginAs(req, res, p.id, p.name);
-    res.json({ ok: true });
+    res.json({ ok: true, token: loginAs(p.id, p.name) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// B) Microsoftログイン（Mojangの承認が下りたら環境変数を入れるだけで有効化）
+// B) Microsoftログイン（Mojangの承認が下りたら環境変数を入れるだけで有効化。RenderのURLで開いたページ用）
 if (auth.msEnabled) {
   app.get('/auth/login', (req, res) => {
     const state = crypto.randomBytes(16).toString('hex');
@@ -418,32 +443,17 @@ if (auth.msEnabled) {
       const st = auth.parseCookies(req.headers.cookie).oauth_state;
       if (!req.query.code || !st || req.query.state !== st) fail('ログインの有効期限が切れました。もう一度お試しください');
       const p = await auth.msProfile(String(req.query.code));
-      loginAs(req, res, p.id, p.name);
-      res.redirect('/#/me');
+      res.redirect('/#token=' + loginAs(p.id, p.name));
     } catch (e) { res.status(400).type('text/plain').send('ログインに失敗しました: ' + e.message); }
   });
 }
-
-// C) 開発用ログイン（ローカルで一人二役のテストをする用。本番では DEV_LOGIN を付けない）
-if (DEV_LOGIN) {
-  app.get('/auth/dev', async (req, res) => {
-    const name = String(req.query.mcid || '').trim();
-    if (!/^\w{3,16}$/.test(name)) return res.status(400).type('text/plain').send('MCIDは3〜16文字の英数字と_だけです');
-    const p = await auth.devProfile(name);
-    loginAs(req, res, p.id, p.name);
-    res.redirect('/#/me');
-  });
-}
-
-app.post('/auth/logout', (req, res) => {
-  res.clearCookie('sid', { httpOnly: true, sameSite: 'lax', secure: req.secure });
-  res.json({ ok: true });
-});
 
 /* ================= 起動 ================= */
 (async () => {
   try { await db.load(); }
   catch (e) { console.error('[db] 起動時の読み込みに失敗しました:', e.message); process.exit(1); }
+  pinAdmins();
+  setInterval(async () => { await db.refreshAdmins(); pinAdmins(); }, 60e3);   // 「admins」シートの変更を1分ごとに反映
   server.listen(PORT, () => console.log(`Practice Tiers 起動: http://localhost:${PORT}`));
 })();
 
