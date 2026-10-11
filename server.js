@@ -312,11 +312,11 @@ io.on('connection', socket => {
     socket.emit('me', meState(uid));
   }
 
-  const on = (ev, fn) => socket.on(ev, (data, ack) => {
+  const on = (ev, fn) => socket.on(ev, async (data, ack) => {
     ack = typeof ack === 'function' ? ack : () => {};
     const u = uid && db.users.get(uid);
     if (!u) return ack({ error: 'ログインが必要です' });
-    try { fn(u, data || {}); ack({ ok: true }); } catch (e) { ack({ error: e.message }); }
+    try { await fn(u, data || {}); ack({ ok: true }); } catch (e) { ack({ error: e.message }); }
   });
   on('session:open', (u, d) => openSession(u, d.event));
   on('session:close', u => closeSession(u.id));
@@ -327,6 +327,7 @@ io.on('connection', socket => {
   on('room:cancel', u => cancelRoom(u));
   on('chat:send', (u, d) => chat(u, d.text));
   on('admin:setTier', (u, d) => adminSetTier(u, d));
+  on('admin:sync', async u => { if (!isAdmin(u)) fail('管理者だけが使えます'); await syncFromSheet(); });
 
   socket.on('disconnect', () => {
     if (!uid) return;
@@ -339,9 +340,42 @@ io.on('connection', socket => {
 function goneOffline(uid) {
   if (online.get(uid)?.size) return;
   if (sessions.has(uid)) closeSession(uid, 'テスターが退席したため受付を終了しました');
-  else if (userQueue.has(uid)) leaveQueue(db.users.get(uid));
+  else if (userQueue.has(uid)) leaveQueue({ id: uid });
 }
 
+/* ---- スプレッドシートを手で直した内容の反映 ---- */
+// シートから消されたユーザーが絡んでいる受付・待機・チャットを片付ける
+function dropUser(uid) {
+  if (sessions.has(uid)) closeSession(uid, 'データが更新されたため、受付を終了しました');
+  const sid = userQueue.get(uid);
+  if (sid) {
+    const s = sessions.get(sid);
+    if (s) s.queue = s.queue.filter(id => id !== uid);
+    userQueue.delete(uid);
+    refresh([sid]);
+  }
+  const r = rooms.get(userRoom.get(uid));
+  if (r) {
+    const other = r.testerId === uid ? r.playerId : r.testerId;
+    dropRoom(r);
+    toast(other, '相手のデータが更新されたため、チャットを閉じました');
+    pump(sessions.get(r.testerId));
+    refresh([r.testerId, r.playerId]);
+  }
+}
+
+// 1分ごと（管理者の「今すぐ反映」ボタンでも）に、シートの内容をサーバーの記憶に取り込む
+async function syncFromSheet() {
+  await db.flushAll();                               // 書き込み待ちを先に送ってから読み直す
+  const { changed, removed } = await db.refreshAll();
+  pinAdmins();
+  removed.forEach(dropUser);
+  if (changed) {
+    io.emit('players:changed');
+    refresh([...online].filter(([, set]) => set.size).map(([id]) => id));
+  }
+  return changed;
+}
 /* ================= REST API ================= */
 const authedUser = req => userFromToken(bearer(req.headers.authorization));
 
@@ -459,7 +493,7 @@ if (auth.msEnabled) {
   try { await db.load(); }
   catch (e) { console.error('[db] 起動時の読み込みに失敗しました:', e.message); process.exit(1); }
   pinAdmins();
-  setInterval(async () => { await db.refreshAdmins(); pinAdmins(); }, 60e3);   // 「admins」シートの変更を1分ごとに反映
+  setInterval(() => syncFromSheet().catch(e => console.error('[sync] 失敗:', e.message)), 60e3);   // シートを手で直した内容を1分ごとに反映
   server.listen(PORT, () => console.log(`Practice Tiers 起動: http://localhost:${PORT}`));
 })();
 
